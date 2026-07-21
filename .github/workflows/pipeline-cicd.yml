@@ -170,363 +170,362 @@ jobs:
           echo "Published image:"
           echo "${{ steps.image.outputs.full_name }}"
 
-
-          # =========================================================
-# Job 3: Deploy Docker image to Docker Desktop Kubernetes
-# =========================================================
-deploy:
-  name: Deploy to Docker Desktop Kubernetes
-
-  runs-on:
-    - self-hosted
-    - Windows
-    - X64
-
-  needs:
-    - test
-    - build
-
-  if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-
-  environment:
-    name: docker-desktop
-    url: http://localhost:30080
-
-  env:
-    KUBERNETES_NAMESPACE: banking
-    HELM_RELEASE: banking
-    HELM_CHART_PATH: ./helm/banking-app
-
-  steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Display deployment information
-      shell: powershell
-      run: |
-        Write-Host "Image repository: ${{ needs.build.outputs.image_repository }}"
-        Write-Host "Image tag: ${{ needs.build.outputs.image_tag }}"
-        Write-Host "Namespace: ${env:KUBERNETES_NAMESPACE}"
-        Write-Host "Helm release: ${env:HELM_RELEASE}"
-        Write-Host "Helm chart: ${env:HELM_CHART_PATH}"
-
-    - name: Verify required tools
-      shell: powershell
-      run: |
-        Write-Host "Checking kubectl..."
-        kubectl version --client
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "kubectl is not installed or not available in PATH."
-        }
-
-        Write-Host "Checking Helm..."
-        helm version
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Helm is not installed or not available in PATH."
-        }
-
-        Write-Host "Checking Docker..."
-        docker version
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Docker Desktop is not running or Docker is unavailable."
-        }
-
-    - name: Select Docker Desktop Kubernetes context
-      shell: powershell
-      run: |
-        kubectl config use-context docker-desktop
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to select Docker Desktop Kubernetes context."
-        }
-
-        $context = kubectl config current-context
-
-        Write-Host "Current Kubernetes context: $context"
-
-        if ($context -ne "docker-desktop") {
-            throw "Expected docker-desktop context but found: $context"
-        }
-
-    - name: Verify Docker Desktop Kubernetes cluster
-      shell: powershell
-      run: |
-        kubectl cluster-info
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Unable to connect to Docker Desktop Kubernetes."
-        }
-
-        kubectl get nodes -o wide
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Docker Desktop Kubernetes node is unavailable."
-        }
-
-    - name: Validate Helm chart
-      shell: powershell
-      run: |
-        helm lint "${env:HELM_CHART_PATH}"
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Helm lint failed."
-        }
-
-    - name: Render Helm templates
-      shell: powershell
-      run: |
-        helm template `
-          "${env:HELM_RELEASE}" `
-          "${env:HELM_CHART_PATH}" `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          --set "image.repository=${{ needs.build.outputs.image_repository }}" `
-          --set "image.tag=${{ needs.build.outputs.image_tag }}" `
-          --set "image.pullPolicy=Always" `
-          > rendered-manifests.yaml
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Helm template rendering failed."
-        }
-
-        Write-Host "Helm templates rendered successfully."
-
-    - name: Create Kubernetes namespace
-      shell: powershell
-      run: |
-        kubectl create namespace "${env:KUBERNETES_NAMESPACE}" `
-          --dry-run=client `
-          -o yaml |
-        kubectl apply -f -
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Namespace creation failed."
-        }
-
-    - name: Deploy application with Helm
-      shell: powershell
-      env:
-        DEPLOY_IMAGE_REPOSITORY: ${{ needs.build.outputs.image_repository }}
-        DEPLOY_IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
-        DEPLOY_DJANGO_SECRET: ${{ secrets.DJANGO_SECRET_KEY }}
-      run: |
-        if ([string]::IsNullOrWhiteSpace($env:DEPLOY_DJANGO_SECRET)) {
-            throw "DJANGO_SECRET_KEY GitHub secret is missing."
-        }
-
-        helm upgrade `
-          --install `
-          "${env:HELM_RELEASE}" `
-          "${env:HELM_CHART_PATH}" `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          --create-namespace `
-          --set "image.repository=${env:DEPLOY_IMAGE_REPOSITORY}" `
-          --set "image.tag=${env:DEPLOY_IMAGE_TAG}" `
-          --set "image.pullPolicy=Always" `
-          --set-string "django.secretKey=${env:DEPLOY_DJANGO_SECRET}" `
-          --set-string "django.debug=False" `
-          --set-string "django.allowedHosts=*" `
-          --wait `
-          --timeout 5m `
-          --atomic
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Helm deployment failed."
-        }
-
-    - name: Verify Helm release
-      shell: powershell
-      run: |
-        helm status `
-          "${env:HELM_RELEASE}" `
-          --namespace "${env:KUBERNETES_NAMESPACE}"
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Helm release verification failed."
-        }
-
-    - name: Verify deployment rollout
-      shell: powershell
-      run: |
-        kubectl rollout status `
-          "deployment/${env:HELM_RELEASE}-banking-app" `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          --timeout=300s
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Kubernetes rollout failed."
-        }
-
-    - name: Verify application pods
-      shell: powershell
-      run: |
-        kubectl wait `
-          --for=condition=Ready `
-          pod `
-          --selector="app.kubernetes.io/instance=${env:HELM_RELEASE},app.kubernetes.io/name=banking-app" `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          --timeout=300s
-
-        if ($LASTEXITCODE -ne 0) {
-            throw "Application pods did not become ready."
-        }
-
-    - name: Display Kubernetes resources
-      shell: powershell
-      run: |
-        Write-Host "===== Pods ====="
-        kubectl get pods `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          -o wide
-
-        Write-Host "===== Services ====="
-        kubectl get services `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          -o wide
-
-        Write-Host "===== Deployments ====="
-        kubectl get deployments `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          -o wide
-
-    - name: Start temporary port-forward
-      shell: powershell
-      run: |
-        $existingProcess = Get-NetTCPConnection `
-          -LocalPort 18080 `
-          -State Listen `
-          -ErrorAction SilentlyContinue
-
-        if ($existingProcess) {
-            Write-Host "Port 18080 is already in use. Attempting to stop the existing process."
-
-            $processIds = $existingProcess |
-              Select-Object -ExpandProperty OwningProcess -Unique
-
-            foreach ($processId in $processIds) {
-                Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
-            }
-        }
-
-        $process = Start-Process `
-          -FilePath "kubectl" `
-          -ArgumentList @(
-            "port-forward",
-            "service/${env:HELM_RELEASE}-banking-app",
-            "18080:80",
-            "--namespace",
-            "${env:KUBERNETES_NAMESPACE}"
-          ) `
-          -PassThru `
-          -WindowStyle Hidden
-
-        $process.Id | Out-File port-forward.pid
-
-        Write-Host "Port-forward started with PID: $($process.Id)"
-
-        Start-Sleep -Seconds 5
-
-        if ($process.HasExited) {
-            throw "kubectl port-forward exited unexpectedly."
-        }
-
-    - name: Wait for Django health endpoint
-      shell: powershell
-      run: |
-        $healthUrl = "http://127.0.0.1:18080/health/"
-        $maximumAttempts = 20
-
-        for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
-            try {
-                Write-Host "Health-check attempt $attempt of $maximumAttempts"
-
-                $response = Invoke-RestMethod `
-                  -Uri $healthUrl `
-                  -Method Get `
-                  -TimeoutSec 10
-
-                Write-Host "Health-check response:"
-                $response | ConvertTo-Json -Depth 5
-
-                if ($response.status -eq "UP") {
-                    Write-Host "Application health check succeeded."
-                    exit 0
-                }
-            }
-            catch {
-                Write-Host "Application is not ready yet: $($_.Exception.Message)"
-            }
-
-            Start-Sleep -Seconds 5
-        }
-
-        throw "Application health check failed after $maximumAttempts attempts."
-
-    - name: Stop temporary port-forward
-      if: always()
-      shell: powershell
-      run: |
-        if (Test-Path port-forward.pid) {
-            $processId = Get-Content port-forward.pid
-
-            Write-Host "Stopping port-forward process: $processId"
-
-            Stop-Process `
-              -Id $processId `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Remove-Item port-forward.pid -Force
-        }
-
-    - name: Show application URL
-      shell: powershell
-      run: |
-        Write-Host ""
-        Write-Host "Deployment completed successfully!"
-        Write-Host "Application URL: http://localhost:30080"
-        Write-Host "Health URL: http://localhost:30080/health/"
-
-    - name: Show diagnostic information after failure
-      if: failure()
-      shell: powershell
-      run: |
-        Write-Host "===== Helm Status ====="
-        helm status `
-          "${env:HELM_RELEASE}" `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          2>$null
-
-        Write-Host "===== Pods ====="
-        kubectl get pods `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          -o wide
-
-        Write-Host "===== Deployment ====="
-        kubectl describe deployment `
-          "${env:HELM_RELEASE}-banking-app" `
-          --namespace "${env:KUBERNETES_NAMESPACE}"
-
-        Write-Host "===== Service ====="
-        kubectl describe service `
-          "${env:HELM_RELEASE}-banking-app" `
-          --namespace "${env:KUBERNETES_NAMESPACE}"
-
-        Write-Host "===== EndpointSlices ====="
-        kubectl get endpointslices `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          -o wide
-
-        Write-Host "===== Events ====="
-        kubectl get events `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          --sort-by='.metadata.creationTimestamp'
-
-        Write-Host "===== Application Logs ====="
-        kubectl logs `
-          "deployment/${env:HELM_RELEASE}-banking-app" `
-          --namespace "${env:KUBERNETES_NAMESPACE}" `
-          --tail=200 `
-          --all-containers=true
+  # =========================================================
+  # Job 3: Deploy Docker image to Docker Desktop Kubernetes
+  # =========================================================
+  deploy:
+    name: Deploy to Docker Desktop Kubernetes
+
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+
+    needs:
+      - test
+      - build
+
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    environment:
+      name: docker-desktop
+      url: http://localhost:30080
+
+    env:
+      KUBERNETES_NAMESPACE: banking
+      HELM_RELEASE: banking
+      HELM_CHART_PATH: ./helm/banking-app
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Display deployment information
+        shell: powershell
+        run: |
+          Write-Host "Image repository: ${{ needs.build.outputs.image_repository }}"
+          Write-Host "Image tag: ${{ needs.build.outputs.image_tag }}"
+          Write-Host "Namespace: ${env:KUBERNETES_NAMESPACE}"
+          Write-Host "Helm release: ${env:HELM_RELEASE}"
+          Write-Host "Helm chart: ${env:HELM_CHART_PATH}"
+
+      - name: Verify required tools
+        shell: powershell
+        run: |
+          Write-Host "Checking kubectl..."
+          kubectl version --client
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "kubectl is not installed or not available in PATH."
+          }
+
+          Write-Host "Checking Helm..."
+          helm version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Helm is not installed or not available in PATH."
+          }
+
+          Write-Host "Checking Docker..."
+          docker version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Docker Desktop is not running or Docker is unavailable."
+          }
+
+      - name: Select Docker Desktop Kubernetes context
+        shell: powershell
+        run: |
+          kubectl config use-context docker-desktop
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to select Docker Desktop Kubernetes context."
+          }
+
+          $context = kubectl config current-context
+
+          Write-Host "Current Kubernetes context: $context"
+
+          if ($context -ne "docker-desktop") {
+              throw "Expected docker-desktop context but found: $context"
+          }
+
+      - name: Verify Docker Desktop Kubernetes cluster
+        shell: powershell
+        run: |
+          kubectl cluster-info
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to connect to Docker Desktop Kubernetes."
+          }
+
+          kubectl get nodes -o wide
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Docker Desktop Kubernetes node is unavailable."
+          }
+
+      - name: Validate Helm chart
+        shell: powershell
+        run: |
+          helm lint "${env:HELM_CHART_PATH}"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Helm lint failed."
+          }
+
+      - name: Render Helm templates
+        shell: powershell
+        run: |
+          helm template `
+            "${env:HELM_RELEASE}" `
+            "${env:HELM_CHART_PATH}" `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            --set "image.repository=${{ needs.build.outputs.image_repository }}" `
+            --set "image.tag=${{ needs.build.outputs.image_tag }}" `
+            --set "image.pullPolicy=Always" `
+            > rendered-manifests.yaml
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Helm template rendering failed."
+          }
+
+          Write-Host "Helm templates rendered successfully."
+
+      - name: Create Kubernetes namespace
+        shell: powershell
+        run: |
+          kubectl create namespace "${env:KUBERNETES_NAMESPACE}" `
+            --dry-run=client `
+            -o yaml |
+          kubectl apply -f -
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Namespace creation failed."
+          }
+
+      - name: Deploy application with Helm
+        shell: powershell
+        env:
+          DEPLOY_IMAGE_REPOSITORY: ${{ needs.build.outputs.image_repository }}
+          DEPLOY_IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DEPLOY_DJANGO_SECRET: ${{ secrets.DJANGO_SECRET_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DEPLOY_DJANGO_SECRET)) {
+              throw "DJANGO_SECRET_KEY GitHub secret is missing."
+          }
+
+          helm upgrade `
+            --install `
+            "${env:HELM_RELEASE}" `
+            "${env:HELM_CHART_PATH}" `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            --create-namespace `
+            --set "image.repository=${env:DEPLOY_IMAGE_REPOSITORY}" `
+            --set "image.tag=${env:DEPLOY_IMAGE_TAG}" `
+            --set "image.pullPolicy=Always" `
+            --set-string "django.secretKey=${env:DEPLOY_DJANGO_SECRET}" `
+            --set-string "django.debug=False" `
+            --set-string "django.allowedHosts=*" `
+            --wait `
+            --timeout 5m `
+            --atomic
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Helm deployment failed."
+          }
+
+      - name: Verify Helm release
+        shell: powershell
+        run: |
+          helm status `
+            "${env:HELM_RELEASE}" `
+            --namespace "${env:KUBERNETES_NAMESPACE}"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Helm release verification failed."
+          }
+
+      - name: Verify deployment rollout
+        shell: powershell
+        run: |
+          kubectl rollout status `
+            "deployment/${env:HELM_RELEASE}-banking-app" `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            --timeout=300s
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Kubernetes rollout failed."
+          }
+
+      - name: Verify application pods
+        shell: powershell
+        run: |
+          kubectl wait `
+            --for=condition=Ready `
+            pod `
+            --selector="app.kubernetes.io/instance=${env:HELM_RELEASE},app.kubernetes.io/name=banking-app" `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            --timeout=300s
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Application pods did not become ready."
+          }
+
+      - name: Display Kubernetes resources
+        shell: powershell
+        run: |
+          Write-Host "===== Pods ====="
+          kubectl get pods `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            -o wide
+
+          Write-Host "===== Services ====="
+          kubectl get services `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            -o wide
+
+          Write-Host "===== Deployments ====="
+          kubectl get deployments `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            -o wide
+
+      - name: Start temporary port-forward
+        shell: powershell
+        run: |
+          $existingProcess = Get-NetTCPConnection `
+            -LocalPort 18080 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if ($existingProcess) {
+              Write-Host "Port 18080 is already in use. Attempting to stop the existing process."
+
+              $processIds = $existingProcess |
+                Select-Object -ExpandProperty OwningProcess -Unique
+
+              foreach ($processId in $processIds) {
+                  Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          $process = Start-Process `
+            -FilePath "kubectl" `
+            -ArgumentList @(
+              "port-forward",
+              "service/${env:HELM_RELEASE}-banking-app",
+              "18080:80",
+              "--namespace",
+              "${env:KUBERNETES_NAMESPACE}"
+            ) `
+            -PassThru `
+            -WindowStyle Hidden
+
+          $process.Id | Out-File port-forward.pid
+
+          Write-Host "Port-forward started with PID: $($process.Id)"
+
+          Start-Sleep -Seconds 5
+
+          if ($process.HasExited) {
+              throw "kubectl port-forward exited unexpectedly."
+          }
+
+      - name: Wait for Django health endpoint
+        shell: powershell
+        run: |
+          $healthUrl = "http://127.0.0.1:18080/health/"
+          $maximumAttempts = 20
+
+          for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+              try {
+                  Write-Host "Health-check attempt $attempt of $maximumAttempts"
+
+                  $response = Invoke-RestMethod `
+                    -Uri $healthUrl `
+                    -Method Get `
+                    -TimeoutSec 10
+
+                  Write-Host "Health-check response:"
+                  $response | ConvertTo-Json -Depth 5
+
+                  if ($response.status -eq "UP") {
+                      Write-Host "Application health check succeeded."
+                      exit 0
+                  }
+              }
+              catch {
+                  Write-Host "Application is not ready yet: $($_.Exception.Message)"
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          throw "Application health check failed after $maximumAttempts attempts."
+
+      - name: Stop temporary port-forward
+        if: always()
+        shell: powershell
+        run: |
+          if (Test-Path port-forward.pid) {
+              $processId = Get-Content port-forward.pid
+
+              Write-Host "Stopping port-forward process: $processId"
+
+              Stop-Process `
+                -Id $processId `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Remove-Item port-forward.pid -Force
+          }
+
+      - name: Show application URL
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "Deployment completed successfully!"
+          Write-Host "Application URL: http://localhost:30080"
+          Write-Host "Health URL: http://localhost:30080/health/"
+
+      - name: Show diagnostic information after failure
+        if: failure()
+        shell: powershell
+        run: |
+          Write-Host "===== Helm Status ====="
+          helm status `
+            "${env:HELM_RELEASE}" `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            2>$null
+
+          Write-Host "===== Pods ====="
+          kubectl get pods `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            -o wide
+
+          Write-Host "===== Deployment ====="
+          kubectl describe deployment `
+            "${env:HELM_RELEASE}-banking-app" `
+            --namespace "${env:KUBERNETES_NAMESPACE}"
+
+          Write-Host "===== Service ====="
+          kubectl describe service `
+            "${env:HELM_RELEASE}-banking-app" `
+            --namespace "${env:KUBERNETES_NAMESPACE}"
+
+          Write-Host "===== EndpointSlices ====="
+          kubectl get endpointslices `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            -o wide
+
+          Write-Host "===== Events ====="
+          kubectl get events `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            --sort-by='.metadata.creationTimestamp'
+
+          Write-Host "===== Application Logs ====="
+          kubectl logs `
+            "deployment/${env:HELM_RELEASE}-banking-app" `
+            --namespace "${env:KUBERNETES_NAMESPACE}" `
+            --tail=200 `
+            --all-containers=true
