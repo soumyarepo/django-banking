@@ -170,5 +170,170 @@ jobs:
           echo "Published image:"
           echo "${{ steps.image.outputs.full_name }}"
 
-  # Deployment is handled locally on the Docker Desktop machine.
-  # Run scripts/deploy-local.ps1 from that machine when you want to deploy.
+  # =========================================================
+  # Job 3: Deploy to local Docker Desktop Kubernetes
+  # =========================================================
+  deploy:
+    name: Deploy to Docker Desktop Kubernetes
+
+    runs-on:
+      - self-hosted
+      - Windows
+      - X64
+      - docker-desktop
+
+    needs:
+      - build
+
+    if: >
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request'
+
+    environment:
+      name: local-docker-desktop
+      url: http://localhost:30080
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Display deployment information
+        shell: powershell
+        run: |
+          Write-Host "Image repository: ${{ needs.build.outputs.image_repository }}"
+          Write-Host "Image tag: ${{ needs.build.outputs.image_tag }}"
+          Write-Host "Full image: ${{ needs.build.outputs.image_full_name }}"
+          Write-Host "Namespace: $env:KUBERNETES_NAMESPACE"
+          Write-Host "Helm release: $env:HELM_RELEASE"
+
+      - name: Verify required tools
+        shell: powershell
+        run: |
+          docker version
+          kubectl version --client
+          helm version
+
+      - name: Select Docker Desktop Kubernetes context
+        shell: powershell
+        run: |
+          kubectl config use-context docker-desktop
+          kubectl config current-context
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create namespace if missing
+        shell: powershell
+        run: |
+          kubectl get namespace $env:KUBERNETES_NAMESPACE 2>$null
+
+          if ($LASTEXITCODE -ne 0) {
+            kubectl create namespace $env:KUBERNETES_NAMESPACE
+          }
+
+      - name: Set current namespace
+        shell: powershell
+        run: |
+          kubectl config set-context --current `
+            --namespace=$env:KUBERNETES_NAMESPACE
+
+      - name: Lint Helm chart
+        shell: powershell
+        run: |
+          helm lint $env:HELM_CHART_PATH
+
+      - name: Render Helm templates
+        shell: powershell
+        run: |
+          helm template $env:HELM_RELEASE $env:HELM_CHART_PATH `
+            --namespace $env:KUBERNETES_NAMESPACE `
+            --set image.repository="${{ needs.build.outputs.image_repository }}" `
+            --set image.tag="${{ needs.build.outputs.image_tag }}" `
+            --set image.pullPolicy="Always" `
+            --set-string django.secretKey="${{ secrets.DJANGO_SECRET_KEY }}" `
+            --set-string django.allowedHosts="localhost,127.0.0.1,*" `
+            --debug | Out-Null
+
+      - name: Deploy with Helm
+        shell: powershell
+        run: |
+          helm upgrade --install $env:HELM_RELEASE $env:HELM_CHART_PATH `
+            --namespace $env:KUBERNETES_NAMESPACE `
+            --create-namespace `
+            --set image.repository="${{ needs.build.outputs.image_repository }}" `
+            --set image.tag="${{ needs.build.outputs.image_tag }}" `
+            --set image.pullPolicy="Always" `
+            --set-string django.secretKey="${{ secrets.DJANGO_SECRET_KEY }}" `
+            --set-string django.allowedHosts="localhost,127.0.0.1,*" `
+            --wait `
+            --atomic `
+            --timeout 5m
+
+      - name: Verify deployment
+        shell: powershell
+        run: |
+          helm status $env:HELM_RELEASE `
+            --namespace $env:KUBERNETES_NAMESPACE
+
+          kubectl get deployments `
+            --namespace $env:KUBERNETES_NAMESPACE
+
+          kubectl get pods `
+            --namespace $env:KUBERNETES_NAMESPACE `
+            -o wide
+
+          kubectl get services `
+            --namespace $env:KUBERNETES_NAMESPACE
+
+          kubectl get endpointslices `
+            --namespace $env:KUBERNETES_NAMESPACE
+
+      - name: Wait for Django rollout
+        shell: powershell
+        run: |
+          kubectl rollout status `
+            deployment/banking-banking-app `
+            --namespace $env:KUBERNETES_NAMESPACE `
+            --timeout=180s
+
+      - name: Test application through NodePort
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 10
+
+          $url = "http://localhost:30080"
+          Write-Host "Testing $url"
+
+          $response = Invoke-WebRequest `
+            -Uri $url `
+            -UseBasicParsing `
+            -TimeoutSec 30
+
+          Write-Host "HTTP status: $($response.StatusCode)"
+
+          if ($response.StatusCode -ne 200) {
+            throw "Application health verification failed."
+          }
+
+      - name: Show diagnostics on failure
+        if: failure()
+        shell: powershell
+        run: |
+          Write-Host "===== Helm status ====="
+          helm status $env:HELM_RELEASE `
+            --namespace $env:KUBERNETES_NAMESPACE 2>$null
+
+          Write-Host "===== Kubernetes resources ====="
+          kubectl get all `
+            --namespace $env:KUBERNETES_NAMESPACE `
+            -o wide
+
+          Write-Host "===== Pod descriptions ====="
+          kubectl describe pods `
+            --namespace $env:KUBERNETES_NAMESPACE
+
+          Write-Host "===== Application logs ====="
+          kubectl logs `
+            --namespace $env:KUBERNETES_NAMESPACE `
+            deployment/banking-banking-app `
+            --all-containers=true `
+            --tail=200
