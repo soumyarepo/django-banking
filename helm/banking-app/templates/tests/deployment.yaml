@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: {{ include "banking-app.fullname" . }}
+
+  labels:
+    {{- include "banking-app.labels" . | nindent 4 }}
+
+spec:
+  replicas: {{ .Values.replicaCount }}
+
+  selector:
+    matchLabels:
+      {{- include "banking-app.selectorLabels" . | nindent 6 }}
+
+  template:
+    metadata:
+      labels:
+        {{- include "banking-app.selectorLabels" . | nindent 8 }}
+
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      containers:
+        - name: banking-app
+
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: {{ include "banking-app.fullname" . }}-config
+
+            - secretRef:
+                name: {{ include "banking-app.fullname" . }}-secret
+
+          readinessProbe:
+            httpGet:
+              path: /health/
+              port: http
+
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+
+          livenessProbe:
+            httpGet:
+              path: /health/
+              port: http
+
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

@@ -1,0 +1,100 @@
+{% extends "banking/base.html" %}
+
+{% block content %}
+
+<section class="hero">
+    <h1>Digital Banking Dashboard</h1>
+
+    <p>
+        Monitor customer accounts, balances and
+        recent money transfers.
+    </p>
+
+    <h2>
+        Total Bank Balance: ₹{{ total_balance }}
+    </h2>
+
+    <a class="button" href="{% url 'transfer' %}">
+        Transfer Money
+    </a>
+</section>
+
+<h2>Customer Accounts</h2>
+
+<div class="grid">
+    {% for account in accounts %}
+        <div class="card">
+            <h3>{{ account.customer_name }}</h3>
+
+            <p>
+                Account: {{ account.account_number }}
+            </p>
+
+            <p>
+                Type: {{ account.get_account_type_display }}
+            </p>
+
+            <p class="balance">
+                ₹{{ account.balance }}
+            </p>
+        </div>
+    {% empty %}
+        <div class="card">
+            <p>
+                No bank accounts are available.
+            </p>
+        </div>
+    {% endfor %}
+</div>
+
+<br>
+
+<h2>Recent Transactions</h2>
+
+<div class="card">
+    <table>
+        <thead>
+            <tr>
+                <th>From</th>
+                <th>To</th>
+                <th>Amount</th>
+                <th>Status</th>
+                <th>Time</th>
+            </tr>
+        </thead>
+
+        <tbody>
+            {% for transaction in transactions %}
+                <tr>
+                    <td>
+                        {{ transaction.sender.customer_name }}
+                    </td>
+
+                    <td>
+                        {{ transaction.receiver.customer_name }}
+                    </td>
+
+                    <td>
+                        ₹{{ transaction.amount }}
+                    </td>
+
+                    <td>
+                        {{ transaction.status }}
+                    </td>
+
+                    <td>
+                        {{ transaction.created_at }}
+                    </td>
+                </tr>
+            {% empty %}
+                <tr>
+                    <td colspan="5">
+                        No transactions found.
+                    </td>
+                </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% endblock %}

@@ -1,0 +1,23 @@
+{% extends "banking/base.html" %}
+
+{% block content %}
+
+<div class="card form-card">
+    <h1>Transfer Money</h1>
+
+    <p>
+        Transfer money securely between customer accounts.
+    </p>
+
+    <form method="post">
+        {% csrf_token %}
+
+        {{ form.as_p }}
+
+        <button class="button" type="submit">
+            Complete Transfer
+        </button>
+    </form>
+</div>
+
+{% endblock %}
