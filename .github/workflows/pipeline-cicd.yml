@@ -1,4 +1,4 @@
-name: Django Banking CI/CD
+name: Django Banking AWS EKS CI/CD
 
 on:
   push:
@@ -13,20 +13,26 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: django-banking-app
+  EKS_CLUSTER_NAME: demo-eks-cluster
+
   PYTHON_VERSION: "3.12"
-  IMAGE_NAME: django-banking-app
+
   HELM_RELEASE: banking
   HELM_CHART_PATH: ./helm/banking-app
   KUBERNETES_NAMESPACE: banking
 
 jobs:
+
   # =========================================================
-  # Job 1: Checkout, install dependencies and test Django
+  # Job 1: Test Django application
   # =========================================================
   test:
-    name: Checkout and Test
+    name: Test Django Application
     runs-on: ubuntu-latest
 
     steps:
@@ -86,12 +92,10 @@ jobs:
         run: |
           python manage.py collectstatic --noinput
 
-      - name: Lint Helm chart
+      - name: Install Helm
         uses: azure/setup-helm@v4
-        with:
-          version: latest
 
-      - name: Run Helm lint
+      - name: Lint Helm chart
         run: |
           helm lint "${HELM_CHART_PATH}"
 
@@ -105,10 +109,10 @@ jobs:
 
 
   # =========================================================
-  # Job 2: Build multi-stage Docker image and push to Docker Hub
+  # Job 2: Build Docker image and push to Amazon ECR
   # =========================================================
-  build:
-    name: Build and Push Docker Image
+  build-and-push:
+    name: Build and Push Image to ECR
     runs-on: ubuntu-latest
     needs:
       - test
@@ -118,40 +122,70 @@ jobs:
     outputs:
       image_repository: ${{ steps.image.outputs.repository }}
       image_tag: ${{ steps.image.outputs.tag }}
-      image_full_name: ${{ steps.image.outputs.full_name }}
+      image_uri: ${{ steps.image.outputs.image_uri }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Convert Docker Hub username to lowercase
-        id: dockerhub
+      # Recommended authentication method:
+      # GitHub OIDC assumes an AWS IAM role.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Create ECR repository if it does not exist
         shell: bash
         run: |
-          USERNAME=$(echo "${{ secrets.DOCKERHUB_USERNAME }}" | tr '[:upper:]' '[:lower:]')
-          echo "username=${USERNAME}" >> "${GITHUB_OUTPUT}"
+          if aws ecr describe-repositories \
+            --repository-names "${ECR_REPOSITORY}" \
+            --region "${AWS_REGION}" >/dev/null 2>&1; then
 
-      - name: Generate immutable image name
+            echo "ECR repository already exists: ${ECR_REPOSITORY}"
+
+          else
+            echo "Creating ECR repository: ${ECR_REPOSITORY}"
+
+            aws ecr create-repository \
+              --repository-name "${ECR_REPOSITORY}" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE \
+              --region "${AWS_REGION}"
+          fi
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate ECR image details
         id: image
         shell: bash
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          IMAGE_REPOSITORY="${{ steps.dockerhub.outputs.username }}/${IMAGE_NAME}"
           IMAGE_TAG="${GITHUB_SHA}"
+          IMAGE_REPOSITORY="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_URI="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 
           echo "repository=${IMAGE_REPOSITORY}" >> "${GITHUB_OUTPUT}"
           echo "tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "full_name=${IMAGE_REPOSITORY}:${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "image_uri=${IMAGE_URI}" >> "${GITHUB_OUTPUT}"
+
+          echo "Image repository: ${IMAGE_REPOSITORY}"
+          echo "Image tag: ${IMAGE_TAG}"
+          echo "Complete image URI: ${IMAGE_URI}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Docker image
+      - name: Build and push Docker image to ECR
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -159,181 +193,158 @@ jobs:
           push: true
 
           tags: |
-            ${{ steps.image.outputs.full_name }}
+            ${{ steps.image.outputs.image_uri }}
             ${{ steps.image.outputs.repository }}:latest
 
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Display published image
+      - name: Display published ECR image
         run: |
-          echo "Published image:"
-          echo "${{ steps.image.outputs.full_name }}"
+          echo "Docker image pushed successfully:"
+          echo "${{ steps.image.outputs.image_uri }}"
+
 
   # =========================================================
-  # Job 3: Deploy to local Docker Desktop Kubernetes
+  # Job 3: Deploy ECR image to Amazon EKS using Helm
   # =========================================================
-  deploy:
-    name: Deploy to Docker Desktop Kubernetes
-
-    runs-on:
-      - self-hosted
-      - Windows
-      - X64
-      - docker-desktop
+  deploy-to-eks:
+    name: Deploy Application to EKS
+    runs-on: ubuntu-latest
 
     needs:
-      - build
+      - test
+      - build-and-push
 
-    if: >
+    if: |
       github.ref == 'refs/heads/main' &&
       github.event_name != 'pull_request'
 
     environment:
-      name: local-docker-desktop
-      url: http://localhost:30080
+      name: production
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Display deployment information
-        shell: powershell
-        run: |
-          Write-Host "Image repository: ${{ needs.build.outputs.image_repository }}"
-          Write-Host "Image tag: ${{ needs.build.outputs.image_tag }}"
-          Write-Host "Full image: ${{ needs.build.outputs.image_full_name }}"
-          Write-Host "Namespace: $env:KUBERNETES_NAMESPACE"
-          Write-Host "Helm release: $env:HELM_RELEASE"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
 
-      - name: Verify required tools
-        shell: powershell
+      - name: Verify AWS identity
         run: |
-          docker version
-          kubectl version --client
-          helm version
+          aws sts get-caller-identity
 
-      - name: Select Docker Desktop Kubernetes context
-        shell: powershell
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Configure kubeconfig for EKS
         run: |
-          kubectl config use-context docker-desktop
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}"
+
+      - name: Verify EKS connectivity
+        run: |
           kubectl config current-context
-          kubectl cluster-info
           kubectl get nodes
+          kubectl cluster-info
 
-      - name: Create namespace if missing
-        shell: powershell
+      - name: Display deployment information
         run: |
-          kubectl get namespace $env:KUBERNETES_NAMESPACE 2>$null
+          echo "EKS cluster: ${EKS_CLUSTER_NAME}"
+          echo "AWS region: ${AWS_REGION}"
+          echo "Namespace: ${KUBERNETES_NAMESPACE}"
+          echo "Helm release: ${HELM_RELEASE}"
+          echo "Image repository: ${{ needs.build-and-push.outputs.image_repository }}"
+          echo "Image tag: ${{ needs.build-and-push.outputs.image_tag }}"
 
-          if ($LASTEXITCODE -ne 0) {
-            kubectl create namespace $env:KUBERNETES_NAMESPACE
-          }
-
-      - name: Set current namespace
-        shell: powershell
+      - name: Validate Helm chart
         run: |
-          kubectl config set-context --current `
-            --namespace=$env:KUBERNETES_NAMESPACE
+          helm lint "${HELM_CHART_PATH}"
 
-      - name: Lint Helm chart
-        shell: powershell
+      - name: Create Kubernetes namespace
         run: |
-          helm lint $env:HELM_CHART_PATH
+          kubectl create namespace "${KUBERNETES_NAMESPACE}" \
+            --dry-run=client \
+            -o yaml |
+          kubectl apply -f -
 
-      - name: Render Helm templates
-        shell: powershell
+      - name: Deploy Django application to EKS
+        env:
+          DEPLOY_IMAGE_REPOSITORY: ${{ needs.build-and-push.outputs.image_repository }}
+          DEPLOY_IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+          DEPLOY_DJANGO_SECRET: ${{ secrets.DJANGO_SECRET_KEY }}
         run: |
-          helm template $env:HELM_RELEASE $env:HELM_CHART_PATH `
-            --namespace $env:KUBERNETES_NAMESPACE `
-            --set image.repository="${{ needs.build.outputs.image_repository }}" `
-            --set image.tag="${{ needs.build.outputs.image_tag }}" `
-            --set image.pullPolicy="Always" `
-            --set-string django.secretKey="${{ secrets.DJANGO_SECRET_KEY }}" `
-            --set-string django.allowedHosts="localhost,127.0.0.1,*" `
-            --debug | Out-Null
+          helm upgrade \
+            --install \
+            "${HELM_RELEASE}" \
+            "${HELM_CHART_PATH}" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --create-namespace \
+            --set "image.repository=${DEPLOY_IMAGE_REPOSITORY}" \
+            --set "image.tag=${DEPLOY_IMAGE_TAG}" \
+            --set "image.pullPolicy=IfNotPresent" \
+            --set-string "django.secretKey=${DEPLOY_DJANGO_SECRET}" \
+            --set-string "django.debug=False" \
+            --set-string "django.allowedHosts=*" \
+            --wait \
+            --timeout 10m \
+            --atomic
 
-      - name: Deploy with Helm
-        shell: powershell
+      - name: Verify deployment rollout
         run: |
-          helm upgrade --install $env:HELM_RELEASE $env:HELM_CHART_PATH `
-            --namespace $env:KUBERNETES_NAMESPACE `
-            --create-namespace `
-            --set image.repository="${{ needs.build.outputs.image_repository }}" `
-            --set image.tag="${{ needs.build.outputs.image_tag }}" `
-            --set image.pullPolicy="Always" `
-            --set-string django.secretKey="${{ secrets.DJANGO_SECRET_KEY }}" `
-            --set-string django.allowedHosts="localhost,127.0.0.1,*" `
-            --wait `
-            --atomic `
-            --timeout 5m
+          kubectl rollout status \
+            "deployment/${HELM_RELEASE}-banking-app" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --timeout=600s
 
-      - name: Verify deployment
-        shell: powershell
+      - name: Display Kubernetes resources
         run: |
-          helm status $env:HELM_RELEASE `
-            --namespace $env:KUBERNETES_NAMESPACE
+          echo "===== Nodes ====="
+          kubectl get nodes -o wide
 
-          kubectl get deployments `
-            --namespace $env:KUBERNETES_NAMESPACE
-
-          kubectl get pods `
-            --namespace $env:KUBERNETES_NAMESPACE `
+          echo "===== Application Resources ====="
+          kubectl get all \
+            --namespace "${KUBERNETES_NAMESPACE}" \
             -o wide
 
-          kubectl get services `
-            --namespace $env:KUBERNETES_NAMESPACE
+          echo "===== Ingress ====="
+          kubectl get ingress \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            -o wide || true
 
-          kubectl get endpointslices `
-            --namespace $env:KUBERNETES_NAMESPACE
-
-      - name: Wait for Django rollout
-        shell: powershell
-        run: |
-          kubectl rollout status `
-            deployment/banking-banking-app `
-            --namespace $env:KUBERNETES_NAMESPACE `
-            --timeout=180s
-
-      - name: Test application through NodePort
-        shell: powershell
-        run: |
-          Start-Sleep -Seconds 10
-
-          $url = "http://localhost:30080"
-          Write-Host "Testing $url"
-
-          $response = Invoke-WebRequest `
-            -Uri $url `
-            -UseBasicParsing `
-            -TimeoutSec 30
-
-          Write-Host "HTTP status: $($response.StatusCode)"
-
-          if ($response.StatusCode -ne 200) {
-            throw "Application health verification failed."
-          }
-
-      - name: Show diagnostics on failure
+      - name: Show diagnostic information after failure
         if: failure()
-        shell: powershell
         run: |
-          Write-Host "===== Helm status ====="
-          helm status $env:HELM_RELEASE `
-            --namespace $env:KUBERNETES_NAMESPACE 2>$null
+          echo "===== Pods ====="
+          kubectl get pods \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            -o wide || true
 
-          Write-Host "===== Kubernetes resources ====="
-          kubectl get all `
-            --namespace $env:KUBERNETES_NAMESPACE `
-            -o wide
+          echo "===== Deployment ====="
+          kubectl describe deployment \
+            "${HELM_RELEASE}-banking-app" \
+            --namespace "${KUBERNETES_NAMESPACE}" || true
 
-          Write-Host "===== Pod descriptions ====="
-          kubectl describe pods `
-            --namespace $env:KUBERNETES_NAMESPACE
+          echo "===== Services ====="
+          kubectl get services \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            -o wide || true
 
-          Write-Host "===== Application logs ====="
-          kubectl logs `
-            --namespace $env:KUBERNETES_NAMESPACE `
-            deployment/banking-banking-app `
-            --all-containers=true `
-            --tail=200
+          echo "===== Events ====="
+          kubectl get events \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --sort-by='.metadata.creationTimestamp' || true
+
+          echo "===== Application Logs ====="
+          kubectl logs \
+            "deployment/${HELM_RELEASE}-banking-app" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --tail=200 || true

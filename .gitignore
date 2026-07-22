@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Django
+db.sqlite3
+*.log
+*.pot
+*.pyc
+/media/
+staticfiles/
+
+# Environment
+.env
+.env.*
+venv/
+ENV/
+env/
+.venv/
+.pytest_cache/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker
+*.log
+docker-compose.override.yml
+
+# Terraform
+terraform.tfstate
+terraform.tfstate.*
+.terraform/
+terraform.tfvars
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+
+# Logs
+*.log
+
+# Django migrations (optional: keep them if you want version control)
+# **/migrations/*.pyc
+# **/migrations/__pycache__/
