@@ -20,7 +20,7 @@ config:
   allowedHosts: "*"
 
 secret:
-  djangoSecretKey: "change-this-banking-secret"
+  djangoSecretKey: ""
 
 containerPort: 8000
 
