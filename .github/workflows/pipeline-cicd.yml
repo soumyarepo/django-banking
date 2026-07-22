@@ -100,11 +100,13 @@ jobs:
 
       - name: Render Helm templates
         run: |
-          helm template "${HELM_RELEASE}" "${HELM_CHART_PATH}" \
+          helm template \
+            "${HELM_RELEASE}" \
+            "${HELM_CHART_PATH}" \
             --namespace "${KUBERNETES_NAMESPACE}" \
-            --set image.repository=test/django-banking-app \
-            --set image.tag=test \
-            --set-string django.secretKey=test-only-secret
+            --set-string "image.repository=test/django-banking-app" \
+            --set-string "image.tag=test" \
+            --set-string "django.secretKey=test-only-secret"
 
   # =========================================================
   # Job 2: Build Docker image and push to Amazon ECR
@@ -118,23 +120,16 @@ jobs:
 
     if: github.event_name != 'pull_request'
 
-    outputs:
-      image_repository: ${{ steps.image.outputs.repository }}
-      image_tag: ${{ steps.image.outputs.tag }}
-      image_uri: ${{ steps.image.outputs.image_uri }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Authenticate using AWS access key and secret access key
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          mask-aws-account-id: true
 
       - name: Verify AWS identity
         run: |
@@ -163,20 +158,39 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Generate ECR image details
+      - name: Generate and validate ECR image details
         id: image
         shell: bash
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
-          IMAGE_TAG="${GITHUB_SHA}"
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
+            --query Account \
+            --output text)"
+
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           IMAGE_REPOSITORY="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_TAG="${GITHUB_SHA}"
           IMAGE_URI="${IMAGE_REPOSITORY}:${IMAGE_TAG}"
 
-          echo "repository=${IMAGE_REPOSITORY}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
-          echo "image_uri=${IMAGE_URI}" >> "${GITHUB_OUTPUT}"
+          if [ -z "${AWS_ACCOUNT_ID}" ]; then
+            echo "ERROR: AWS account ID is empty."
+            exit 1
+          fi
 
+          if [ -z "${IMAGE_REPOSITORY}" ]; then
+            echo "ERROR: ECR image repository is empty."
+            exit 1
+          fi
+
+          if [ -z "${IMAGE_TAG}" ]; then
+            echo "ERROR: Docker image tag is empty."
+            exit 1
+          fi
+
+          echo "IMAGE_REPOSITORY=${IMAGE_REPOSITORY}" >> "${GITHUB_ENV}"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "${GITHUB_ENV}"
+          echo "IMAGE_URI=${IMAGE_URI}" >> "${GITHUB_ENV}"
+
+          echo "AWS account: ${AWS_ACCOUNT_ID}"
           echo "Image repository: ${IMAGE_REPOSITORY}"
           echo "Image tag: ${IMAGE_TAG}"
           echo "Complete image URI: ${IMAGE_URI}"
@@ -190,18 +204,22 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-
           tags: |
-            ${{ steps.image.outputs.image_uri }}
-            ${{ steps.image.outputs.repository }}:latest
-
+            ${{ env.IMAGE_URI }}
+            ${{ env.IMAGE_REPOSITORY }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Display published ECR image
+      - name: Verify image exists in ECR
+        shell: bash
         run: |
-          echo "Docker image pushed successfully:"
-          echo "${{ steps.image.outputs.image_uri }}"
+          aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${GITHUB_SHA}" \
+            --region "${AWS_REGION}"
+
+          echo "Docker image successfully pushed:"
+          echo "${IMAGE_URI}"
 
   # =========================================================
   # Job 3: Deploy ECR image to Amazon EKS using Helm
@@ -225,14 +243,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Authenticate using AWS access key and secret access key
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          mask-aws-account-id: true
 
       - name: Verify AWS identity
         run: |
@@ -256,18 +272,68 @@ jobs:
           kubectl get nodes
           kubectl cluster-info
 
-      - name: Display deployment information
+      # Build the ECR URI again instead of passing it from another job.
+      - name: Generate deployment image details
+        shell: bash
         run: |
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
+            --query Account \
+            --output text)"
+
+          DEPLOY_IMAGE_REPOSITORY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+          DEPLOY_IMAGE_TAG="${GITHUB_SHA}"
+          DEPLOY_IMAGE_URI="${DEPLOY_IMAGE_REPOSITORY}:${DEPLOY_IMAGE_TAG}"
+
+          if [ -z "${AWS_ACCOUNT_ID}" ]; then
+            echo "ERROR: AWS account ID is empty."
+            exit 1
+          fi
+
+          if [ -z "${DEPLOY_IMAGE_REPOSITORY}" ]; then
+            echo "ERROR: Deployment image repository is empty."
+            exit 1
+          fi
+
+          if [ -z "${DEPLOY_IMAGE_TAG}" ]; then
+            echo "ERROR: Deployment image tag is empty."
+            exit 1
+          fi
+
+          echo "DEPLOY_IMAGE_REPOSITORY=${DEPLOY_IMAGE_REPOSITORY}" >> "${GITHUB_ENV}"
+          echo "DEPLOY_IMAGE_TAG=${DEPLOY_IMAGE_TAG}" >> "${GITHUB_ENV}"
+          echo "DEPLOY_IMAGE_URI=${DEPLOY_IMAGE_URI}" >> "${GITHUB_ENV}"
+
           echo "EKS cluster: ${EKS_CLUSTER_NAME}"
           echo "AWS region: ${AWS_REGION}"
           echo "Namespace: ${KUBERNETES_NAMESPACE}"
           echo "Helm release: ${HELM_RELEASE}"
-          echo "Image repository: ${{ needs.build-and-push.outputs.image_repository }}"
-          echo "Image tag: ${{ needs.build-and-push.outputs.image_tag }}"
+          echo "Deployment image: ${DEPLOY_IMAGE_URI}"
+
+      - name: Verify deployment image exists in ECR
+        run: |
+          aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids "imageTag=${DEPLOY_IMAGE_TAG}" \
+            --region "${AWS_REGION}"
+
+          echo "Confirmed image exists: ${DEPLOY_IMAGE_URI}"
 
       - name: Validate Helm chart
         run: |
           helm lint "${HELM_CHART_PATH}"
+
+      - name: Render Helm chart with deployment image
+        run: |
+          helm template \
+            "${HELM_RELEASE}" \
+            "${HELM_CHART_PATH}" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --set-string "image.repository=${DEPLOY_IMAGE_REPOSITORY}" \
+            --set-string "image.tag=${DEPLOY_IMAGE_TAG}" \
+            --set-string "image.pullPolicy=IfNotPresent" \
+            --set-string "django.secretKey=test-render-secret" \
+            --set-string "django.debug=False" \
+            --set-string "django.allowedHosts=*"
 
       - name: Create Kubernetes namespace
         run: |
@@ -278,25 +344,40 @@ jobs:
 
       - name: Deploy Django application to EKS
         env:
-          DEPLOY_IMAGE_REPOSITORY: ${{ needs.build-and-push.outputs.image_repository }}
-          DEPLOY_IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
           DEPLOY_DJANGO_SECRET: ${{ secrets.DJANGO_SECRET_KEY }}
         run: |
+          echo "Deploying image: ${DEPLOY_IMAGE_URI}"
+
           helm upgrade \
             --install \
             "${HELM_RELEASE}" \
             "${HELM_CHART_PATH}" \
             --namespace "${KUBERNETES_NAMESPACE}" \
             --create-namespace \
-            --set "image.repository=${DEPLOY_IMAGE_REPOSITORY}" \
-            --set "image.tag=${DEPLOY_IMAGE_TAG}" \
-            --set "image.pullPolicy=IfNotPresent" \
-            --set-string "django.secretKey=${DEPLOY_DJANGO_SECRET}" \
-            --set-string "django.debug=False" \
-            --set-string "django.allowedHosts=*" \
+            --set-string "image.repository=${DEPLOY_IMAGE_REPOSITORY}" \
+            --set-string "image.tag=${DEPLOY_IMAGE_TAG}" \
+            --set-string "image.pullPolicy=IfNotPresent" \
+            --set-string "secret.djangoSecretKey=${DEPLOY_DJANGO_SECRET}" \
+            --set-string "config.debug=False" \
+            --set-string "config.allowedHosts=*" \
             --wait \
             --timeout 10m \
-            --atomic
+            --rollback-on-failure
+
+      - name: Verify deployment image
+        run: |
+          DEPLOYED_IMAGE="$(kubectl get deployment \
+            "${HELM_RELEASE}-banking-app" \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --output jsonpath='{.spec.template.spec.containers[0].image}')"
+
+          echo "Expected image: ${DEPLOY_IMAGE_URI}"
+          echo "Deployed image: ${DEPLOYED_IMAGE}"
+
+          if [ "${DEPLOYED_IMAGE}" != "${DEPLOY_IMAGE_URI}" ]; then
+            echo "ERROR: Kubernetes deployment is using an unexpected image."
+            exit 1
+          fi
 
       - name: Verify deployment rollout
         run: |
@@ -307,11 +388,25 @@ jobs:
 
       - name: Display Kubernetes resources
         run: |
+          echo "===== Helm Release ====="
+          helm status "${HELM_RELEASE}" \
+            --namespace "${KUBERNETES_NAMESPACE}"
+
           echo "===== Nodes ====="
           kubectl get nodes -o wide
 
-          echo "===== Application Resources ====="
-          kubectl get all \
+          echo "===== Deployments ====="
+          kubectl get deployments \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            -o wide
+
+          echo "===== Pods ====="
+          kubectl get pods \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            -o wide
+
+          echo "===== Services ====="
+          kubectl get services \
             --namespace "${KUBERNETES_NAMESPACE}" \
             -o wide
 
@@ -323,12 +418,34 @@ jobs:
       - name: Show diagnostic information after failure
         if: failure()
         run: |
+          echo "===== Helm Releases ====="
+          helm list \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --all || true
+
+          echo "===== Helm Status ====="
+          helm status "${HELM_RELEASE}" \
+            --namespace "${KUBERNETES_NAMESPACE}" || true
+
+          echo "===== Deployments ====="
+          kubectl get deployments \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            -o wide || true
+
           echo "===== Pods ====="
           kubectl get pods \
             --namespace "${KUBERNETES_NAMESPACE}" \
             -o wide || true
 
-          echo "===== Deployment ====="
+          echo "===== Pod Descriptions ====="
+          for pod in $(kubectl get pods \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            --output name 2>/dev/null); do
+            kubectl describe "${pod}" \
+              --namespace "${KUBERNETES_NAMESPACE}" || true
+          done
+
+          echo "===== Deployment Description ====="
           kubectl describe deployment \
             "${HELM_RELEASE}-banking-app" \
             --namespace "${KUBERNETES_NAMESPACE}" || true
@@ -347,4 +464,5 @@ jobs:
           kubectl logs \
             "deployment/${HELM_RELEASE}-banking-app" \
             --namespace "${KUBERNETES_NAMESPACE}" \
+            --all-containers=true \
             --tail=200 || true

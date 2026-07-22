@@ -1,9 +1,9 @@
 replicaCount: 1
 
 image:
-  repository: soumyakube/django-banking-app
+  repository: 744376745946.dkr.ecr.ap-south-1.amazonaws.com/securebank_prod_images
   tag: latest
-  pullPolicy: Always
+  pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 
